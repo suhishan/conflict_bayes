@@ -1,0 +1,379 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Load up all the required libraries and the data. 
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(brms)
+library(haven)
+library(ggdag)
+library(ggrepel)
+library(patchwork)
+
+theme_set(theme_bw() + 
+            theme(panel.grid = element_blank()))
+
+options(scipen = 999)
+
+d <- read_dta("final_conflict.dta")
+```
+
+Standardize and clean some require variables. 
+
+
+```{r}
+d <- d %>% 
+  mutate(
+    best_est = ifelse(is.na(best_est), 0, best_est),
+    incidents = ifelse(is.na(incidents), 0, incidents),
+    deaths_per_10000 = (best_est/TotalPopn) * 1e4,
+  ) %>% 
+  mutate(
+    e = rethinking::standardize(elevation_max),
+    f = rethinking::standardize(norm_forest * 100),
+    p = rethinking::standardize(pov_rate * 100),
+    ci = rethinking::standardize(incidents), #conflict incidences
+    cd = rethinking::standardize(best_est),
+    cdt = rethinking:: standardize(deaths_per_10000)#conflict deaths. 
+  )
+```
+
+The general DAG is as follows:
+
+Elevation --> Conflict Incidences (ci)
+Elevation --> Forest Cover (f)
+Forest Cover(f) --> Conflict Incidences. 
+
+Let's draw some scatterplots.
+
+```{r}
+# Relationship between Forest Cover and Conflict Incidences.
+d %>% 
+  ggplot(aes(x = f, y = ci)) +
+  geom_point(shape = 1, size = 3, color = "firebrick")+
+  labs(x = "Forest Cover (standardized)",
+       y = "Conflict Incidences (standardized)")
+
+# Relationship between Elevation and Conflict Incidences.
+d %>% 
+  ggplot(aes(x = e, y = ci)) +
+  geom_point(shape = 1, size = 3, color = "firebrick4")+
+  labs(x = "Maxium Elevation (standardized)",
+       y = "Conflict Incidences (standardized)")
+
+# Relationship between Forested Proportion and Elevation
+
+d %>% 
+  ggplot(aes(x = e, y = f)) +
+  geom_point(shape = 1, size = 3, color = "firebrick4")+
+  labs(x = "Maxium Elevation (standardized)",
+       y = "Proportion of Forests (standardized)")+
+    geom_text_repel(data = . %>% 
+                      filter(distname %in%c("Achham","Rukum",
+                                            "Rolpa", "Dang")),
+                    aes(label = distname))
+
+
+# Looks very much like an inverted U
+
+
+# Any relationship between Conflict Incidences (not deaths) and the poverty rate.
+
+d %>% 
+  ggplot(aes(x = p, y = ci)) +
+  geom_point(shape = 1, size = 3, color = "firebrick4")+
+  labs(x = "Poverty Rate(standardized)",
+       y = "Conflict Incidences (standardized)")
+
+
+
+```
+
+
+# Let's now see the relationship between forest cover and Conflict Incidences using brms
+
+```{r}
+m1_cf <- brm(
+  data = d,
+  family = gaussian,
+  ci ~ 1 + f,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T
+)
+
+m1_ce <- brm(
+  data = d,
+  family = gaussian,
+  ci ~ 1 + e,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T
+)
+
+```
+
+Let's sample some priors:
+
+```{r}
+prior_cf <- prior_draws(m1_cf)
+
+prior_cf %>% 
+  slice_sample(n = 50) %>% 
+  rownames_to_column("draw") %>% 
+  expand_grid(f = c(-2, 2)) %>% 
+  mutate(ci = Intercept + b * f) %>% 
+  ggplot(aes(x = f, y = ci)) +
+  geom_line(aes(group = draw))
+
+# Plot the fitted values agains the data.
+
+fitted(m1_cf) %>% 
+  data.frame() %>% 
+  bind_cols(d) %>% 
+  
+  ggplot(aes(x = f, y = ci))+
+  geom_point(shape = 1, size = 3, color = "firebrick4")+
+  geom_smooth(stat = "identity",
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5),
+              color = "firebrick4",
+              fill = "firebrick4",
+              alpha = 1/4)+
+  labs(x = "Forest Cover (std)",
+       y = "Conflict Incidences(std)")
+
+```
+
+This positive relationship between forest cover and conflict incidence may be spurious because elevation of a district does impact both : highly elevated areas have low forest cover, but highly elevated areas are also prone to more conflict incidences due to its strategic nature.
+
+For this we will need a multiple regression.
+
+
+```{r}
+m1_cfe <- brm(
+  data = d,
+  family = gaussian,
+  ci ~ 1 + f + e,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T
+)
+
+```
+ 
+Let's make a full-luxury bayes framework for the entire causal model.
+
+
+```{r}
+c_model <- bf(ci ~ 1 + f + e)
+e_model <- bf(f ~ 1 + e)
+
+
+m2 <- brm(
+  data = d,
+  family = gaussian,
+  c_model + e_model + set_rescor(FALSE),
+  
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept, resp = ci),
+    prior(normal(0, 0.5), class = b, resp = ci),
+    prior(exponential(1), class = sigma, resp = ci),
+    
+    prior(normal(0, 0.2), class = Intercept, resp = f),
+    prior(normal(0, 0.5), class = b, resp = f),
+    prior(exponential(1), class = sigma, resp = f)),
+  iter = 2000, warmup = 1000, seed = 5, cores = 4, chains = 4,
+  file = "fits/m2"
+  
+)
+```
+
+From the scatterplot and even thinking, it seems that elevation and forest cover and non-linearly related. High elevation predicts high forests upto a point and then forested area decreases. 
+
+Let's make two models : One linking elevation and forest_cover in a linear fashion and the other one is non-linear. Let's plot both sisde by side. 
+
+```{r}
+d <- d %>% mutate(
+  e_s2 = e^2
+)
+# Linear Relationship
+
+m1_fe <- brm(
+  data = d,
+  family = gaussian,
+  f ~ 1 + e,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T,
+  file = "fits/m1_fe"
+)
+
+m1_fe_nl <- brm(
+  data = d,
+  family = gaussian,
+  f ~ 1 + e_s2,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T,
+  file = "fits/m1_fe_nl"
+)
+
+
+```
+Let's look at both these graphs. Fit 2 shows that we probably need to account for the non-linearity in the relationship between forest cover and maximum elevation. 
+
+```{r}
+fit_1 <- fitted(m1_fe) %>% 
+  data.frame() %>% 
+  bind_cols(d) %>% 
+  
+  ggplot(aes(x = e, y = f))+
+  geom_point(shape = 1, size = 3, color = "firebrick")+
+  geom_smooth(stat = "identity",
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5),
+              color = "firebrick",
+              fill = "firebrick",
+              alpha = 1/4) +
+  labs(x = "Max Elevation (std)",
+       y = "Forest Cover (std)")
+
+fit_2 <- fitted(m1_fe_nl) %>% 
+  data.frame() %>% 
+  bind_cols(d) %>% 
+  
+  ggplot(aes(x = e, y = f))+
+  geom_point(shape = 1, size = 3, color = "firebrick")+
+  geom_smooth(stat = "identity",
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5),
+              color = "firebrick",
+              fill = "firebrick",
+              alpha = 1/4) +
+  labs(x = "Max Elevation (std)",
+       y = "Forest Cover (std)")
+
+fit_1 | fit_2
+
+```
+
+
+Non-linear full luxury bayes
+
+```{r}
+e_model_nl <- bf(f ~ 1 + e_s2)
+
+m2_nl <-  brm(
+  data = d,
+  family = gaussian,
+  c_model + e_model_nl + set_rescor(FALSE),
+  
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept, resp = ci),
+    prior(normal(0, 0.5), class = b, resp = ci),
+    prior(exponential(1), class = sigma, resp = ci),
+    
+    prior(normal(0, 0.2), class = Intercept, resp = f),
+    prior(normal(0, 0.5), class = b, resp = f),
+    prior(exponential(1), class = sigma, resp = f)),
+  iter = 2000, warmup = 1000, seed = 5, cores = 4, chains = 4,
+  file = "fits/m2_nl"
+  
+)
+
+  
+```
+
+
+Let's make predictor residual plots.
+
+Normal Model residuals.
+
+```{r}
+rf <- data.frame(residuals(m1_fe))
+d$rf <- r$Estimate
+
+m3_cf <- brm(
+  data = d,
+  family = gaussian,
+  ci ~ 1 + rf,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T
+)
+
+rf_nl <- data.frame(residuals(m1_fe_nl))
+d$rf_nl <- rf_nl$Estimate
+
+m3_cf_nl <- brm(
+  data = d,
+  family = gaussian,
+  ci ~ 1 + rf_nl,
+  prior = c(
+    prior(normal(0, 0.2), class = Intercept),
+    prior(normal(0, 0.5), class = b),
+    prior(exponential(1), class = sigma)
+  ),
+  iter = 2000, warmup = 1000, cores = 4, chains = 4,
+  sample_prior = T
+)
+
+```
+
+
+Plotting Predictor residual plots.
+
+```{r}
+f1 <- fitted(m3_cf) %>% 
+  data.frame() %>% 
+  bind_cols(d) %>% 
+  
+  ggplot(aes(x = rf, y = ci))+
+  geom_point(shape = 1, size = 3, color = "red")+
+  geom_smooth(stat = "identity",
+    aes(y = Estimate, ymin = Q2.5, ymax = Q97.5),
+    color = "red", fill = "firebrick", alpha = 1/4)+
+  labs(x = "Forest Cover Residual (linear)")
+
+f2 <- fitted(m3_cf_nl) %>% 
+  data.frame() %>% 
+  bind_cols(d) %>% 
+  
+  ggplot(aes(x = rf_nl, y = ci))+
+  geom_point(shape = 1, size = 3, color = "red")+
+  geom_smooth(aes(y = Estimate, ymin = Q2.5, ymax = Q97.5),
+              stat = "identity",
+              color = "red",
+              fill = "firebrick",
+              alpha = 1/4)
+
+
+f1 | f2
+```
+
